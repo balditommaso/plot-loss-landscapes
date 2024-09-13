@@ -6,8 +6,10 @@ import copy
 import typing
 import torch.nn
 import numpy as np
+from pyhessian import hessian
+from torch.utils.data import DataLoader
 from loss_landscapes.model_interface.model_wrapper import ModelWrapper, wrap_model
-from loss_landscapes.model_interface.model_parameters import rand_u_like, orthogonal_to
+from loss_landscapes.model_interface.model_parameters import rand_u_like, orthogonal_to, ModelParameters
 from loss_landscapes.metrics.metric import Metric
 
 
@@ -85,8 +87,12 @@ def linear_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
 
 
 # noinspection DuplicatedCode
-def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=0.1, steps=100,
-                normalization='filter', deepcopy_model=False) -> np.ndarray:
+def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], 
+                metric: Metric, 
+                distance: float = 0.1, 
+                steps: int = 100,
+                normalization: str = 'filter', 
+                deepcopy_model: bool = False) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along a
     linear subspace of the parameter space defined by a start point and a randomly sampled direction.
@@ -132,6 +138,51 @@ def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric
     start_point = model_start_wrapper.get_module_parameters()
     direction = rand_u_like(start_point)
 
+    if normalization == 'model':
+        direction.model_normalize_(start_point)
+    elif normalization == 'layer':
+        direction.layer_normalize_(start_point)
+    elif normalization == 'filter':
+        direction.filter_normalize_(start_point)
+    elif normalization is None:
+        pass
+    else:
+        raise AttributeError('Unsupported normalization argument. Supported values are model, layer, and filter')
+
+    direction.mul_(((start_point.model_norm() * distance) / steps) / direction.model_norm())
+
+    data_values = []
+    for i in range(steps):
+        # add a step along the line to the model parameters, then evaluate
+        start_point.add_(direction)
+        data_values.append(metric(model_start_wrapper))
+
+    return np.array(data_values)
+
+
+def hessian_line(
+        model_start: typing.Union[torch.nn.Module, ModelWrapper], 
+        metric: Metric, 
+        dataloader: DataLoader,
+        distance: float = 0.1, 
+        steps: int = 100,
+        normalization: str = 'filter', 
+        n_iter: int = 100,
+        deepcopy_model: bool = False) -> np.ndarray:
+    # create wrappers from deep copies to avoid aliasing if desired
+    model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
+
+    # obtain start point in parameter space and random direction
+    # random direction is randomly sampled, then normalized, and finally scaled by distance/steps
+    start_point = model_start_wrapper.get_module_parameters()
+    hessian_comp = hessian(model_start,
+                           model_start.criterion,
+                           dataloader=dataloader,
+                           cuda=torch.cuda.is_available())
+    _, eigenvector = hessian_comp.eigenvalues(top_n=1, maxIter=n_iter)
+    
+    direction = ModelParameters(eigenvector[0])
+    
     if normalization == 'model':
         direction.model_normalize_(start_point)
     elif normalization == 'layer':
@@ -229,8 +280,13 @@ def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
 
 
 # noinspection DuplicatedCode
-def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=1, steps=20,
-                 normalization='filter', deepcopy_model=False) -> np.ndarray:
+def random_plane(
+        model: typing.Union[torch.nn.Module, ModelWrapper], 
+        metric: Metric, 
+        distance=1, 
+        steps=20,
+        normalization='filter', 
+        deepcopy_model=False) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along a planar
     subspace of the parameter space defined by a start point and two randomly sampled directions.
@@ -323,5 +379,92 @@ def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Met
 
     return np.array(data_matrix)
 
+
+def hessian_plane(
+        model: typing.Union[torch.nn.Module, ModelWrapper], 
+        metric: Metric, 
+        dataloader: DataLoader, 
+        distance: int = 1,
+        steps: int = 20,
+        normalization: str = 'filter',
+        n_iter: int = 100, 
+        deepcopy_model: bool = False) -> np.ndarray:
+    """
+    Same concept of the random plane but the directions are the two-top eigenvectors of the model.
+
+    Args:
+        model (typing.Union[torch.nn.Module, ModelWrapper]): _description_
+        metric (Metric): _description_
+        dataloader (DataLoader): _description_
+        distance (int, optional): _description_. Defaults to 1.
+        steps (int, optional): _description_. Defaults to 20.
+        normalization (str, optional): _description_. Defaults to 'filter'.
+        deepcopy_model (bool, optional): _description_. Defaults to False.
+
+    Returns:
+        np.ndarray: _description_
+    """
+    model_start_wrapper = wrap_model(copy.deepcopy(model) if deepcopy_model else model)
+    
+    start_point = model_start_wrapper.get_module_parameters()
+    hessian_comp = hessian(model,
+                           model.criterion,
+                           dataloader=dataloader,
+                           cuda=torch.cuda.is_available())
+    eigenvalue, eigenvector = hessian_comp.eigenvalues(top_n=2, maxIter=n_iter)
+    
+    dir_one, dir_two = ModelParameters(eigenvector[0] / eigenvalue[0]), ModelParameters(eigenvector[1] / eigenvalue[1])
+    
+    # if normalization == 'model':
+    #     dir_one.model_normalize_(start_point)
+    #     dir_two.model_normalize_(start_point)
+    # elif normalization == 'layer':
+    #     dir_one.layer_normalize_(start_point)
+    #     dir_two.layer_normalize_(start_point)
+    # elif normalization == 'filter':
+    #     dir_one.filter_normalize_(start_point)
+    #     dir_two.filter_normalize_(start_point)
+    # elif normalization is None:
+    #     pass
+    # else:
+    #     raise AttributeError('Unsupported normalization argument. Supported values are model, layer, and filter')
+
+    # scale to match steps and total distance
+    dir_one.mul_(((start_point.model_norm() * distance) / steps) / dir_one.model_norm())
+    dir_two.mul_(((start_point.model_norm() * distance) / steps) / dir_two.model_norm())
+    # Move start point so that original start params will be in the center of the plot
+    dir_one.mul_(steps / 2)
+    dir_two.mul_(steps / 2)
+    start_point.sub_(dir_one)
+    start_point.sub_(dir_two)
+    dir_one.truediv_(steps / 2)
+    dir_two.truediv_(steps / 2)
+    
+    data_matrix = []
+    # evaluate loss in grid of (steps * steps) points, where each column signifies one step
+    # along dir_one and each row signifies one step along dir_two. The implementation is again
+    # a little convoluted to avoid constructive operations. Fundamentally we generate the matrix
+    # [[start_point + (dir_one * i) + (dir_two * j) for j in range(steps)] for i in range(steps].
+    for i in range(steps):
+        data_column = []
+
+        for j in range(steps):
+            # for every other column, reverse the order in which the column is generated
+            # so you can easily use in-place operations to move along dir_two
+            if i % 2 == 0:
+                start_point.add_(dir_two)
+                data_column.append(metric(model_start_wrapper))
+            else:
+                start_point.sub_(dir_two)
+                data_column.insert(0, metric(model_start_wrapper))
+
+        data_matrix.append(data_column)
+        start_point.add_(dir_one)
+
+    return np.array(data_matrix)
+    
+    
+    
+    
 
 # todo add hypersphere function

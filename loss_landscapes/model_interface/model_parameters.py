@@ -14,6 +14,7 @@ import math
 import numpy as np
 import torch
 import torch.nn
+from typing import Tuple, Union
 
 
 class ModelParameters:
@@ -202,7 +203,7 @@ class ModelParameters:
         for parameter in self.parameters:
             parameter *= (ref_point.model_norm(order) / self.model_norm())
 
-    def layer_normalize_(self, ref_point: 'ModelParameters', order=2):
+    def layer_normalize_(self, ref_point: 'ModelParameters', order: Union[str, int] = 'fro'):
         """
         In-place layer-wise normalization of the tensor.
         :param ref_point: use this model's layer norms, if given
@@ -210,10 +211,10 @@ class ModelParameters:
         :return: none
         """
         # in-place normalize each parameter
-        for layer_idx, parameter in enumerate(self.parameters, 0):
+        for layer_idx, parameter in enumerate(self.parameters):
             parameter *= (ref_point.layer_norm(layer_idx, order) / self.layer_norm(layer_idx, order))
 
-    def filter_normalize_(self, ref_point: 'ModelParameters', order=2):
+    def filter_normalize_(self, ref_point: 'ModelParameters', order: Union[str, int] = 'fro'):
         """
         In-place filter-wise normalization of the tensor.
         :param ref_point: use this model's filter norms, if given
@@ -221,12 +222,13 @@ class ModelParameters:
         :return: none
         """
         for l in range(len(self.parameters)):
-            # normalize one-dimensional bias vectors
-            if len(self.parameters[l].size()) == 1:
-                self.parameters[l] *= (ref_point.parameters[l].norm(order) / self.parameters[l].norm(order))
-            # normalize two-dimensional weight vectors
-            for f in range(len(self.parameters[l])):
-                self.parameters[l][f] *= ref_point.filter_norm((l, f), order) / (self.filter_norm((l, f), order))
+            if len(self.parameters[l].size()) > 0:
+                # normalize one-dimensional bias vectors
+                if len(self.parameters[l].size()) == 1:
+                    self.parameters[l] *= (torch.norm(ref_point.parameters[l], p=order) / torch.norm(self.parameters[l], p=order))
+                # normalize two-dimensional weight vectors
+                for f in range(len(self.parameters[l])):
+                    self.parameters[l][f] *= ref_point.filter_norm((l, f), order) / (self.filter_norm((l, f), order))
 
     def model_norm(self, order=2) -> float:
         """
@@ -240,7 +242,7 @@ class ModelParameters:
             for layer in self.parameters
         ]), 1.0 / order)
 
-    def layer_norm(self, index, order=2) -> float:
+    def layer_norm(self, index: int, order: Union[str, int] = 'fro') -> float:
         """
         Returns a list of layer-wise L-norms of the tensor.
         :param order: norm order, e.g. 2 for L2 norm
@@ -248,9 +250,11 @@ class ModelParameters:
         :return: list of L-norms of layers
         """
         # L-n norms of layer where we treat each layer as a flat other
-        return math.pow(torch.pow(self.parameters[index], order).sum().item(), 1.0 / order)
+        return torch.norm(self.parameters[index], p=order).item()
+        # return math.pow(torch.pow(self.parameters[index], order).sum().item(), 1.0 / order)
+        
 
-    def filter_norm(self, index, order=2) -> float:
+    def filter_norm(self, index: Tuple[int, int], order: Union[str, int] = 'fro') -> float:
         """
         Returns a 2D list of filter-wise L-norms of the tensor.
         :param order: norm order, e.g. 2 for L2 norm
@@ -258,7 +262,8 @@ class ModelParameters:
         :return: list of L-norms of filters
         """
         # L-n norm of each filter where we treat each layer as a flat other
-        return math.pow(torch.pow(self.parameters[index[0]][index[1]], order).sum().item(), 1.0 / order)
+        return torch.norm(self.parameters[index[0]][index[1]], p=order).item()
+        # return math.pow(torch.pow(self.parameters[index[0]][index[1]], order).sum().item(), 1.0 / order)
 
     def as_numpy(self) -> np.ndarray:
         """
@@ -286,7 +291,7 @@ def rand_u_like(example_vector: ModelParameters) -> ModelParameters:
     new_vector = []
 
     for param in example_vector:
-        new_vector.append(torch.rand(size=param.size(), dtype=example_vector[0].dtype))
+        new_vector.append(torch.rand(size=param.size(), dtype=example_vector[0].dtype, device=param.device))
 
     return ModelParameters(new_vector)
 
@@ -302,7 +307,7 @@ def rand_n_like(example_vector: ModelParameters) -> ModelParameters:
     new_vector = []
 
     for param in example_vector:
-        new_vector.append(torch.randn(size=param.size(), dtype=example_vector[0].dtype))
+        new_vector.append(torch.randn(size=param.size(), dtype=example_vector[0].dtype, device=param.device))
 
     return ModelParameters(new_vector)
 
